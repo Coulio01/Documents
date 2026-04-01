@@ -1,0 +1,223 @@
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from pyspark.sql import *
+from typing import *
+from datetime import *
+import pandas as pd
+import json
+%run /Helpers/CodeGen/PySparkSchemaToMetadataHelper
+"""
+QualityEventType are:
+  EmptyBatch   
+  BadInputData
+  DataCastFailure
+  DataNullFailure
+  Metric
+  SchemaDrift
+  DebugDataset
+  MissingSK
+"""
+
+class QualityMonitoringHelper:
+  eventOutputLocation = '/mnt/ADLS/Audit/Monitoring'    
+  sourceName = None
+  messageName = None
+  
+  dims = {}
+  
+  #done
+  def __init__(self, sourceName, messageName, dims={}):
+    self.sourceName = sourceName
+    self.messageName = messageName  
+    self.dims = dims
+    
+    self.dims['databricks-clusterId'] = spark.conf.get('spark.databricks.clusterUsageTags.clusterId')
+    self.dims['databricks-clusterName'] = spark.conf.get('spark.databricks.clusterUsageTags.clusterName')
+    self.dims['databricks-sparkVersion'] = spark.conf.get('spark.databricks.clusterUsageTags.sparkVersion')
+    self.dims['databricks-clusterOwnerOrgId'] = spark.conf.get('spark.databricks.clusterUsageTags.clusterOwnerOrgId')
+  
+  #done
+  def addContext(self, key, value):
+    self.dims[key] = value
+  
+  #done
+  def registerEmptyBatch(self, eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'EmptyBatch'
+    QualityEventMessage = 'No rows in a batch'
+    
+    df = self._createeventsDf(None, QualityEventTimestamp, QualityEventType, QualityEventMessage)       
+    return self._writeeventsDf(df)      
+
+  #done
+  def registerBadInputData(self, badDataDf, rowCount, eventTimestamp=None):    
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'BadInputData'
+    QualityEventMessage = '{} row(s) did not match expected input format'.format(rowCount)
+    
+    df = self._createeventsDf(badDataDf, QualityEventTimestamp, QualityEventType, QualityEventMessage)       
+    return self._writeeventsDf(df)       
+  
+  def registerDataCastFailure(self, badDataDf, rowCount, castCheckColumnName="_cast_check_error_message", eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'DataCastFailure'    
+    
+    badDataDf = badDataDf.withColumn('QualityEventMessage', concat(lit('Cast Failed for: '), col(castCheckColumnName)))
+      
+    df = self._createeventsDf(badDataDf, QualityEventTimestamp, QualityEventType)       
+    return self._writeeventsDf(df)
+  
+  def registerDataNullFailure(self, badDataDf, subMessage, nullCheckColumnName="_null_check_error_message", eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'DataNullFailure'    
+    
+    badDataDf = badDataDf.withColumn('QualityEventMessage', concat(lit('Null Check Failed for: '), col(nullCheckColumnName)))
+      
+    df = self._createeventsDf(badDataDf, QualityEventTimestamp, QualityEventType)  
+  
+    return self._writeeventsDf(df)
+  
+  def registerMissingSK(self, badDataDf, missingSKColumnName="missingSK", eventTimestamp=None):    
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'MissingSK'
+    #QualityEventMessage = '{} row(s) are missing at least one SK'.format(rowCount)
+    
+    badDataDf = badDataDf.withColumn('QualityEventMessage', concat(lit('SK missing for: '), col(missingSKColumnName)))
+    
+    df = self._createeventsDf(badDataDf, QualityEventTimestamp, QualityEventType)       
+    return self._writeeventsDf(df)
+  
+  def registerDebugDataset(self, dataFrame, datasetName, tags=None, eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'DebugDataset'    
+    QualityEventMessage = 'DebugDataset for {}'.format(datasetName)
+    
+    if isinstance(dataFrame, pd.DataFrame):
+      dataFrame = spark.createDataFrame(dataFrame)
+    
+    dataFrame = dataFrame \
+      .withColumn('DebugDatasetName', lit(datasetName)) \
+      .withColumn('DebugDatasetTags', lit(tags))
+    
+    df = self._createeventsDf(dataFrame, QualityEventTimestamp, QualityEventType)  
+  
+    return self._writeeventsDf(df) 
+  
+  def debug(self, dataFrame, datasetName, tags=None):
+    df = self.registerDebugDataset(dataFrame, datasetName, tags)
+    
+    display(df)
+  
+  #done
+  def registerMetric(self, metricName, metricValue, metricMessage=None, metricMessageVerb=None, eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'Metric'    
+           
+    if metricMessageVerb == None:
+      metricMessageVerb = "is"
+      
+    if metricMessage == None:
+      metricMessage = "{} {} {}".format(metricName, metricMessageVerb, metricValue)
+      
+    eventsDf = self \
+      ._createeventsDf(None,  QualityEventTimestamp, 'Metric', metricMessage) \
+      .withColumn('QualityMetricName', lit(metricName)) \
+      .withColumn('QualityMetricValue', lit(metricValue)) 
+    
+    return self._writeeventsDf(eventsDf)
+  
+  #todo
+  def registerSchemaDrift(self, drift, eventTimestamp=None):
+    agg = drift.groupby(['SchemaDriftType', 'StereoType'],observed=True, as_index=False).agg({'AttributePath':', '.join})
+    agg['QualityEventMessage'] = agg['StereoType'].astype(str) + '(s) ' + agg['SchemaDriftType'].astype(str) + ': ' + agg['AttributePath'].astype(str)
+
+    schema = StructType([
+      StructField('QualityEventType', StringType(), False)
+      ,StructField('SchemaDriftType', StringType(), False)
+      ,StructField('StereoType', StringType(), False)
+      ,StructField('QualityEventMessage', StringType(), False)  
+    ])   
+    
+    eventsDf = spark.createDataFrame(agg, schema) 
+    eventsDf = self._createeventsDf(eventsDf, eventTimestamp, 'SchemaDrift')
+    
+    return self._writeeventsDf(eventsDf)
+
+  #done
+  def registerNoNewFiles(self, eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'NoNewFiles'
+    QualityEventMessage = 'No New File''s for Today !!!'
+        
+    df = self._createeventsDf(None, QualityEventTimestamp, QualityEventType, QualityEventMessage)       
+    return self._writeeventsDf(df)     
+  
+   #done
+  def expectedFilesMismatch(self, message='', eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'ExpectedFilesMismatch'
+    QualityEventMessage = message
+      
+    df = self._createeventsDf(None, QualityEventTimestamp, QualityEventType, QualityEventMessage)       
+    return self._writeeventsDf(df)     
+  
+   #done
+  def registerEmptyFile(self, message='', eventTimestamp=None):
+    QualityEventTimestamp = eventTimestamp if eventTimestamp is not None else datetime.now()
+    QualityEventType = 'EmptyFileLoaded'
+    QualityEventMessage = message
+      
+    df = self._createeventsDf(None, QualityEventTimestamp, QualityEventType, QualityEventMessage)       
+    return self._writeeventsDf(df)     
+ 
+  #done
+  def _createeventsDf(self, eventsDf, QualityEventTimestamp, QualityEventType, QualityEventMessage=None):    
+    if QualityEventTimestamp is None:
+      QualityEventTimestamp = datetime.now()        
+      
+    if eventsDf is None:
+      schema = StructType([StructField('QualityEventType', StringType(), False)])
+      rows = [Row(QualityEventType='')]
+      eventsDf = spark.createDataFrame(rows, schema)   
+    
+    if QualityEventMessage is not None:
+       eventsDf = eventsDf.withColumn('QualityEventMessage', lit(QualityEventMessage)) 
+        
+    eventsDf = eventsDf \
+      .withColumn('QualityEventType', lit(QualityEventType)) \
+      .withColumn('QualityEventTimestamp', lit(QualityEventTimestamp)) \
+      .withColumn('QualityEventDate', col('QualityEventTimestamp').cast('date')) \
+      .withColumn('SourceName', lit(self.sourceName)) \
+      .withColumn('MessageName', lit(self.messageName))
+    
+    #add all the parameters from the options
+    for k, v in self.dims.items():
+      eventsDf = eventsDf.withColumn(k, lit(v))       
+
+    return eventsDf     
+  
+  def _writeeventsDf(self, eventsDf):
+    #cast all non technical columns a string to eliminate schema problems :)    
+    columnsToCleanUp = eventsDf.columns
+    columnsToCleanUp.remove('QualityEventTimestamp')
+    columnsToCleanUp.remove('QualityEventDate')
+    
+    for c in columnsToCleanUp:
+      eventsDf = eventsDf.withColumn(c, col(c).cast('string'))
+      
+    #ensure that technical columns have right type   
+    eventsDf = eventsDf \
+      .withColumn('QualityEventTimestamp', col('QualityEventTimestamp').cast(TimestampType())) \
+      .withColumn('QualityEventDate', col('QualityEventDate').cast(DateType()))
+    
+    spark.conf.set("spark.databricks.io.directoryCommit.createSuccessFile","false")
+    #write the events
+    eventsDf \
+      .coalesce(1) \
+      .write \
+      .partitionBy('QualityEventDate', 'SourceName', 'MessageName') \
+      .format('parquet') \
+      .mode('append') \
+      .save(self.eventOutputLocation)    
+    
+    return eventsDf

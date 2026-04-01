@@ -1,0 +1,77 @@
+class PartitionPruning:  
+  def __init__(self, df, partitionFields):
+    self.partitionFields = partitionFields
+        
+    partitionKeysDf = PartitionPruning._buildPartitionUsageDf(df, self.partitionFields).cache()
+    
+    self.partitionKeysPandasDf = partitionKeysDf.toPandas()
+    self.partitionData = partitionKeysDf.drop('_count').collect()       
+    
+  def getPartitionPredicateSQL(self, tableAlias):
+    """    
+    returns SQL predicate for given table alias
+    
+    Parameters:
+    - alias of the table to create SQL filter predicates for       
+    """
+
+    rowPredicates = []
+
+    for row in self.partitionData:
+      values = [PartitionPruning._sql_sanitize_string(p) for p in row]
+      d = dict(zip(self.partitionFields, values))
+
+      filterArray = [ "%s.`%s` = '%s'" % (tableAlias, k, v) for (k, v) in d.items()]
+      filterSQL = "(" + " AND ".join(filterArray) + ")"
+
+      rowPredicates.append(filterSQL)
+
+    return "( " + " OR ".join(rowPredicates) + " )"
+    
+  
+  def _sql_sanitize_string(s):    
+  
+    a = str(s).replace("'", "").replace("`", "").replace('"', '')
+    assert(a == s)
+    return a
+      
+  def _buildPartitionUsageDf(df, partitionFields):
+    """
+    returns dataframe containing agregated count by the partition fields columns
+    it enfoces that each of the partition fields is casted as string
+
+    Parameters:
+    - df: source data frame containing all the data, including the partitioning columns/fields
+    - partitionFields: list of partition fields
+
+    Example: 
+    ---------------------------------------
+    let that df schema is:
+      - Year, Month, Day, Hour is a string
+      - Date is a date
+
+    returned dataframe will be eq. of this sql statement:
+
+    ```
+    select Year, Month, Day, Hour, cast(Date as String) as Date, count(1) as _count
+    from df
+    group by Year, Month, Day, Hour, Date
+    order by Year, Month, Day, Hour, Date
+    ```
+    """
+   
+    assert(len(partitionFields) > 0)
+
+    partDf = df
+
+    #cast all columns as strings
+    for pc in partitionFields:
+      partDf = partDf.withColumn(pc, col(pc).cast('string'))
+
+    partDf = partDf.groupBy(partitionFields) \
+      .agg(count(lit(1)).alias('_count')) \
+      .orderBy(partitionFields)
+      
+    return partDf  
+  
+

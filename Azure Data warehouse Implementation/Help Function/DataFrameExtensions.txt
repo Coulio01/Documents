@@ -1,0 +1,313 @@
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from pyspark.sql.window import *
+from datetime import datetime, timedelta
+from pyspark.sql.dataframe import DataFrame
+import pandas as pd
+import json
+######
+###
+### Cast Error Checking Extensions 
+###
+######
+def ext_withColumnCastCheck(self, colName, col, ignoreSrcNulls=True, checkColumnPrefix='_cast_check_'):       
+  """Adds column using spark's .withColumn() method and additionaly adds not null check fields to data frame.
+  
+  Additionally added fields are prefixed with 'checkColumnPrefix' parameter.
+  
+  The method intented use is to check data conversion / casting failure for columns that are changed in place.
+  Hhence the previous/original value of the column is lost after making the conversion.
+
+  Parameters
+  ----------
+  colName : str
+    the name of column, as per spark's withColumn() method
+  
+  col : expr
+    the expression that will create the column, as per spark's withColumn() method
+    
+  ignoreSrcNulls: Boolean
+    If True, cast failure will only be flagged when inpt 'colName' was not null and output 'colName' is null. 
+    If False, cast failure will be raised when output 'colName' is null, without checking the input 'colName' nullability at all.
+  
+  Examples:
+  ---------
+  df = df.ext_withColumnCastCheck("endDateValid", unix_timestamp(col('endDateValid'), "yyyy-MM-dd'T'HH.mm.ss.SSSZ").cast(TimestampType()))
+
+  Will add following columns to df:
+
+  - endDateValid : replacing existing column
+  - _cast_check_src_endDateValid : containing original value of the endDateValid column
+  - _cast_check_failed_endDateValid : containing True if cast check has failed.   
+  
+  
+  """
+  
+  srcColumnName = checkColumnPrefix + 'src_' + colName  
+
+  df = self \
+    .withColumn(srcColumnName, self[colName]) \
+    .withColumn(colName, col) 
+
+  if ignoreSrcNulls:
+    df = df.withColumn(checkColumnPrefix + 'failed_' + colName, df[srcColumnName].isNotNull() & df[colName].isNull())
+  else:
+    df = df.withColumn(checkColumnPrefix + 'failed_' + colName, df[colName].isNull())       
+
+  return df
+
+def ext_dropCastCheckColumns(self, keepColumns=[], checkColumnPrefix='_cast_check_'):    
+  df = self
+   
+  dontDropList=[]
+  for c in keepColumns:
+    dontDropList.append(checkColumnPrefix + 'src_' + c)
+    dontDropList.append(checkColumnPrefix + 'failed_' + c)
+   
+  for c in self.columns:
+    if c.startswith(checkColumnPrefix) and (c not in dontDropList) and (c not in keepColumns):
+      df = df.drop(c)
+
+  return df
+
+def ext_addCastFailedSummaryColumn(self, checkColumnPrefix='_cast_check_'):
+  failedPrefix = checkColumnPrefix + 'failed_'
+  
+  checkExpr = lit(False)  
+  
+  for c in self.columns:
+    if c.startswith(failedPrefix):
+      checkExpr = checkExpr | col(c)
+      
+  df = self.withColumn(checkColumnPrefix + 'failed', checkExpr)
+  
+  return df  
+
+def ext_getDFWithCastFailedRowsAndFriendlyErrorMessage(self, idColumns, alreadyFiltered=False, checkColumnPrefix='_cast_check_'):  
+  failedPrefix = checkColumnPrefix + 'failed_'
+  failedPrefixLen = len(failedPrefix)
+  failedColumnNames = []
+  
+  df = self
+  
+  ###
+  ## add marker row that shows rows that failed casting, if not already filtered down
+  ###
+ 
+  checkExpr = lit(False)  
+
+  for c in self.columns:
+    if c.startswith(failedPrefix):
+      failedColumnNames.append(c)
+      checkExpr = checkExpr | col(c)
+
+  if alreadyFiltered == False:  
+    df = df.filter(checkExpr)
+
+  errorMessageColumn = checkColumnPrefix + 'error_message'      
+
+  df = df.withColumn(errorMessageColumn, lit(''))
+  i = 0
+
+  ###
+  ## build **this**:
+  ##   **Record(key='1234', other='56'):** year('20xxx01' as int), desc2('Z' as int)      
+  ##
+  for c in idColumns:
+    if i == 0:
+      df = df.withColumn(errorMessageColumn, concat(errorMessageColumn, lit('Record(')))
+    else:
+      df = df.withColumn(errorMessageColumn, concat(errorMessageColumn, lit(', ')))
+
+    df = df.withColumn(errorMessageColumn, concat(
+        errorMessageColumn
+        ,lit(c) 
+        ,when(col(c).isNull(), lit('=null')).otherwise(concat(lit('=\''), col(c), lit(''), lit('\'')))
+      ))
+
+    i = i + 1
+
+  if i > 0:
+    df = df.withColumn(errorMessageColumn, concat(errorMessageColumn, lit('): ')))   
+
+  ####
+  ## build **this**:
+  ## Record(key='1234', other='56'): **year('20xxx01' as int), desc2('Z' as int)**   
+  ####
+  for c in failedColumnNames:
+    colName = c[failedPrefixLen:]
+    colType = [dtype for name, dtype in df.dtypes if name == colName][0]
+    srcColName = checkColumnPrefix + 'src_' + colName
+
+    #glue the names of the columns, this syntax is awful!
+    df = df.withColumn(errorMessageColumn, concat(
+      col(errorMessageColumn)
+      ,when(col(c), 
+        concat(
+          lit(colName)         
+          ,lit('(\'')
+          ,when(col(srcColName).isNull(), lit('')).otherwise(col(srcColName))
+          ,lit('\' as ')
+          ,lit(colType)
+          ,lit(')')            
+          ,lit(', '))
+      ).otherwise(lit('')))
+    )  
+
+  df = df.withColumn(errorMessageColumn, regexp_replace(col(errorMessageColumn), '(, )$', ''))  
+
+  return df
+
+def ext_splitCastCheckRows(inputDf, idColumns, checkColumnPrefix='_cast_check_'):   
+  castFailedColumn = checkColumnPrefix + 'failed'  
+  errorMessageColumn = checkColumnPrefix + 'error_message'
+  
+  tmp = inputDf \
+    .ext_addCastFailedSummaryColumn() \
+    .cache()
+  
+  goodDf = tmp.filter(col(castFailedColumn) == False) \
+    .ext_dropCastCheckColumns() \
+    .cache()
+    
+  castFailedDf = tmp \
+    .filter(col(castFailedColumn) == True) \
+    .ext_getDFWithCastFailedRowsAndFriendlyErrorMessage(idColumns=idColumns, alreadyFiltered=True) \
+    .ext_dropCastCheckColumns(keepColumns=[castFailedColumn, errorMessageColumn]) \
+    .cache()
+  
+  tmp.unpersist()
+  
+  castFailedCount = castFailedDf.count()
+  
+  inputDf = inputDf.ext_dropCastCheckColumns()    
+    
+  return (inputDf, goodDf, castFailedDf, castFailedCount)
+
+
+
+def ext_nullifyEmptyStrings(self, cols=None):
+#  if cols==None:
+#    cols=self.columns
+  
+  df = self
+  
+  for (c, t) in df.dtypes:
+    if t == "string":
+      df = df.withColumn(c, when(col(c) == "",lit(None)).otherwise(col(c)))
+  return df
+
+#register these functions in DataFrame class :)
+DataFrame.ext_withColumnCastCheck = ext_withColumnCastCheck
+DataFrame.ext_dropCastCheckColumns = ext_dropCastCheckColumns 
+DataFrame.ext_addCastFailedSummaryColumn = ext_addCastFailedSummaryColumn
+DataFrame.ext_getDFWithCastFailedRowsAndFriendlyErrorMessage = ext_getDFWithCastFailedRowsAndFriendlyErrorMessage
+DataFrame.ext_splitCastCheckRows = ext_splitCastCheckRows
+DataFrame.ext_nullifyEmptyStrings = ext_nullifyEmptyStrings
+######
+###
+### Null Input Data Checking Extensions 
+###
+######
+def ext_getDFWithNullCheckFailedRowsAndFriendlyErrorMessage(self, columnsToCheck, idColumns, alreadyFiltered=False, checkColumnPrefix='_null_check_'):
+  df = self
+        
+  columnsToCheck = list(set(columnsToCheck+idColumns))  
+        
+  ###
+  ## add marker row that shows rows that failed casting, if not already filtered down
+  ###
+  if alreadyFiltered == False:  
+    df = df \
+      .ext_addNullCheckFailedSummaryColumn(columnsToCheck=columnsToCheck, checkColumnPrefix=checkColumnPrefix) \
+      .filter(checkExpr)
+
+  errorMessageColumn = checkColumnPrefix + 'error_message'      
+
+  df = df.withColumn(errorMessageColumn, lit(''))
+  i = 0
+
+  ###
+  ## build **this**:
+  ##   **Record(key='1234', other='56') nulls:** year, desc2
+  ##
+  for c in idColumns:
+    if i == 0:
+      df = df.withColumn(errorMessageColumn, concat(errorMessageColumn, lit('Record(')))
+    else:
+      df = df.withColumn(errorMessageColumn, concat(errorMessageColumn, lit(', ')))
+
+    df = df.withColumn(errorMessageColumn, concat(
+        errorMessageColumn
+        ,lit(c) 
+        ,when(col(c).isNull(), lit('=null')).otherwise(concat(lit('=\''), col(c), lit(''), lit('\'')))
+      ))
+
+    i = i + 1
+
+  if i > 0:
+    df = df.withColumn(errorMessageColumn, concat(errorMessageColumn, lit(') nulls: ')))   
+
+  ####
+  ## build **this**:
+  ## Record(key='1234', other='56') nulls: **year, desc2**
+  ####
+  for c in columnsToCheck:
+    #glue the names of the columns, this syntax is awful!
+    df = df.withColumn(errorMessageColumn, concat(
+      col(errorMessageColumn)
+      ,when(col(c).isNull(), 
+        concat(
+          lit(c)         
+         ,lit(', '))
+      ).otherwise(lit('')))
+    )  
+
+  df = df.withColumn(errorMessageColumn, regexp_replace(col(errorMessageColumn), '(, )$', ''))  
+
+  return df
+
+def ext_addNullCheckFailedSummaryColumn(self, columnsToCheck, checkColumnPrefix='_null_check_'):
+  checkExpr = lit(False)  
+  
+  for c in columnsToCheck:
+    checkExpr = checkExpr | col(c).isNull()
+      
+  df = self.withColumn(checkColumnPrefix + 'failed', checkExpr)
+  
+  return df  
+
+def ext_dropNullCheckColumns(self, keepColumns=[], checkColumnPrefix='_null_check_'):    
+  return ext_dropCastCheckColumns(self, keepColumns=[], checkColumnPrefix=checkColumnPrefix)    
+
+def ext_splitNullCheckRows(inputDf, columnsToCheck, idColumns, checkColumnPrefix='_null_check_'):  
+  nullCheckFailedColumn = checkColumnPrefix + 'failed'  
+  nullCheckErrorMessageColumn = checkColumnPrefix + 'error_message'
+
+  tmp = inputDf \
+    .ext_addNullCheckFailedSummaryColumn(columnsToCheck) \
+    .cache()
+
+  goodDf = tmp.filter(col(nullCheckFailedColumn) == False) \
+    .ext_dropNullCheckColumns() \
+    .cache()
+
+  badDf = tmp \
+    .filter(col(nullCheckFailedColumn) == True) \
+    .ext_getDFWithNullCheckFailedRowsAndFriendlyErrorMessage(idColumns=idColumns, columnsToCheck=columnsToCheck, alreadyFiltered=True) \
+    .cache()
+
+  #.ext_dropNullCheckColumns(keepColumns=[nullCheckFailedColumn, nullCheckErrorMessageColumn])
+  tmp.unpersist()
+
+  badCount = badDf.count()
+
+  inputDf = inputDf.ext_dropNullCheckColumns()    
+
+  return (inputDf, goodDf, badDf, badCount)
+
+
+DataFrame.ext_getDFWithNullCheckFailedRowsAndFriendlyErrorMessage = ext_getDFWithNullCheckFailedRowsAndFriendlyErrorMessage
+DataFrame.ext_addNullCheckFailedSummaryColumn = ext_addNullCheckFailedSummaryColumn
+DataFrame.ext_dropNullCheckColumns = ext_dropNullCheckColumns
+DataFrame.ext_splitNullCheckRows = ext_splitNullCheckRows

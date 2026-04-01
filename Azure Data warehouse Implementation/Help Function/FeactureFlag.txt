@@ -1,0 +1,86 @@
+from pyspark.sql.functions import *
+from pyspark.sql import *
+from pyspark.sql.types import *
+from typing import *
+from datetime import *
+%sql
+
+CREATE DATABASE IF NOT EXISTS FeatureFlags;
+
+CREATE TABLE IF NOT EXISTS FeatureFlags.BooleanStore
+(
+   KEY STRING 
+  ,VALUE BOOLEAN  
+)
+USING delta
+LOCATION '/mnt/ADLS/Audit/FeatureFlags/BooleanStore' 
+class FeatureFlags:
+  """
+    Controls feature flag on current databricks instance.
+    
+    Examples:
+    ---------
+    # set a feature flag:
+    FeatureFlags.set('NOVA.RetailPrice.EHCapture.Enabled', True)
+    
+    # get a feature flag:
+    isEnabled = FeatureFlags.get('NOVA.RetailPrice.EHCapture.Enabled')
+    
+    If feature flag is not set, get will return always False, as if feature is not set.  
+  """
+  
+  def get(key):
+    """
+      Returns boolean value of a key from FeatureFlags.BooleanStore table, or False if value is not found
+      
+      Parameters:
+      ----------
+      Key is always converted to lower case in lower case.   
+    """
+    
+    if "'" in key:
+      raise ValueError("Key cannot contain ' character")
+    
+    ret = table('FeatureFlags.BooleanStore') \
+      .filter(col('KEY') == lit(key)) \
+      .select(col('VALUE')) \
+      .collect()
+
+    if len(ret) == 0:
+      return False
+
+    return bool(ret[0][0])
+  
+  def set(key, value):
+    """     
+      Sets the key value to specified value.
+      
+      Parameters:
+      ----------
+      Key is always converted to lower case in lower case.
+      Value has to be boolean
+    """
+       
+    if "'" in key:
+      raise ValueError("Key cannot contain ' character")
+      
+    if not isinstance(value, bool):
+      raise ValueError("Value has to be boolean")       
+     
+    spark.sql("DELETE FROM FeatureFlags.BooleanStore WHERE KEY = '{key}'".format(key=key))
+    spark.sql("INSERT INTO FeatureFlags.BooleanStore VALUES('{key}', {value})".format(key=key, value=value))
+
+  def remove(key):
+    """
+      Removes the feature flag if not longer is needed
+      
+      Parameters:
+      ----------
+      Key is always converted to lower case in lower case.
+    """
+      
+    if "'" in key:
+      raise ValueError("Key cannot contain ' character")
+      
+    spark.sql("DELETE FROM FeatureFlags.BooleanStore WHERE KEY = '{key}'".format(key=key))
+    

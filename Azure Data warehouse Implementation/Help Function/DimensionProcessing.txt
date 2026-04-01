@@ -1,0 +1,32 @@
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+
+class DimensionProcessingHelper: 
+  
+  def calculateIncrement(inputLatestRecords, refRecordsInScope, versioningKeys, incrementTimestamp):
+    # upsert for new or updated 
+    toUpsert = inputLatestRecords.subtract(refRecordsInScope) \
+      .withColumn("__ActionFlag", lit("U")) \
+      .withColumn("__ModifiedTimestamp", lit(incrementTimestamp))   
+     
+    # flag all outdated records to delete.  
+    toDelete = refRecordsInScope.subtract(inputLatestRecords) \
+      .withColumn("__ActionFlag", lit("D")) \
+      .withColumn("__ModifiedTimestamp", lit(incrementTimestamp))
+
+    incrementDf = toUpsert.unionAll(
+      toDelete.join(toUpsert, versioningKeys, "left_anti").select(toDelete["*"]))
+    
+    return incrementDf
+  
+  # exclude all the historical rows from the data set
+  def excludeHistoricalUpdates(inputLatestRecords, refRecordsInScope, validToColumnName, sourceMessageGranularityKeys):
+    # get the earliest versioned record by message pk
+    minDatePerCleanPk = inputLatestRecords.groupBy(sourceMessageGranularityKeys).agg(min(validToColumnName).alias("__MinStartDateValid"))
+    
+    refRecordsInScope = refRecordsInScope \
+      .join(minDatePerCleanPk, sourceMessageGranularityKeys) \
+      .filter(refRecordsInScope[validToColumnName] >= minDatePerCleanPk["__MinStartDateValid"]) \
+      .select(refRecordsInScope["*"])
+    
+    return refRecordsInScope
