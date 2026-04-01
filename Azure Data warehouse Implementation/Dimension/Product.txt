@@ -1,0 +1,381 @@
+%md ```This notebook was generated using Blade Code Generator v20.3.0.0-ccdf694, by AzureAD\StefanSchenk at 2020-07-27 13:03:59```
+%run /Helpers/FeatureFlags
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from datetime import datetime, timedelta
+from pyspark.sql.window import Window
+import pandas as pd
+import pyspark.sql.functions as func
+import json
+
+spark.conf.set("spark.databricks.delta.optimizeWrite.enabled","true")
+spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled","false")
+spark.conf.set("spark.databricks.optimizer.dynamicPartitionPruning","true")
+spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.autoCompact", "false")
+%run "/Helpers/DimensionProcessingHelper"
+%run /Helpers/Monitoring/QualityMonitoringHelper
+%run /Helpers/DataFrameExtensions
+%run /Helpers/PartitionPruning
+%md # Initialize Data Quality Monitoring
+monitor = QualityMonitoringHelper('SAPCAR', 'Product')
+monitor.addContext('NotebookName', 'ProductMD.Clean2Prepared.py')
+monitor.addContext('SubMessage', 'Product')
+# TODO
+# TODO: Chose behavriour when PK validation finds errors (or totally disable it, and eventually, let job fail)
+# TODO
+PerformPKValidation = True
+OnPKValidationError = 'RejectPK'
+#OnPKValidationError = 'TakeFirstPK'
+#OnPKValidationError = 'RaiseException'
+
+DebugOutputEnabled = FeatureFlags.get('SAPCAR.Product.DebugOutputEnabled')
+
+#create SQL table 'jobparams', containing one row with 'modifiedTimestamp'
+#this is executed on a driver side, and it's going be used by all the workers, so that we get always the same timestamp on every single worker
+batchTimestamp = datetime.now()
+
+spark.createDataFrame(
+	pd.DataFrame(data={ 
+		'batchTimestamp': [ batchTimestamp ] 
+	})).createOrReplaceTempView('jobparams')
+
+monitor.addContext('BatchDateTime', batchTimestamp)
+%md # Create output table
+## Debug only, usefull to cleaning up data if it's already in bad shape :)
+dbutils.fs.rm('/mnt/ADLS/Prepared/Product/Product/DELTA', True)
+%sql
+
+DROP TABLE IF EXISTS Prepared_Product_Product;
+
+CREATE TABLE Prepared_Product_Product(
+  `article_number` STRING
+  ,`article_ft` STRING
+  ,`brand` STRING
+  ,`brand_ft` STRING
+  ,`merchandise_category` STRING
+  ,`main_supplier` STRING
+  ,`main_supplier_ft` STRING
+  ,`legacy_id` STRING
+  ,`product_base_input` STRING
+  ,`product_old_id` STRING
+  ,`created_on` DATE
+  ,`purchase_order_unit_of_measure` STRING
+  ,`length` DECIMAL(13, 3)
+  ,`width` DECIMAL(13, 3)
+  ,`height` DECIMAL(13, 3)
+  ,`minimum_remaining_shelf_life` DECIMAL(4, 0)
+  ,`total_shelf_life` DECIMAL(4, 0)
+  ,`storage_percentage` DECIMAL(4, 0)
+  ,`content_unit` STRING
+  ,`net_content` DECIMAL(13, 3)
+  ,`sub_brand` STRING
+  ,`purchase_group_ft` STRING
+  ,`source_of_supply` STRING
+  ,`supplier_subrange_ft` STRING
+  ,`purchase_group` STRING
+  ,`file_timestamp` TIMESTAMP
+  ,`input_file_name` STRING
+  ,`__ModifiedTimestamp` TIMESTAMP
+  ,`__DeletedFlag` BOOLEAN
+)
+USING delta
+LOCATION '/mnt/ADLS/Prepared/Product/Product/DELTA'
+# use fixed latest snapshot of data, this will reduce overhead on hive to check it each time, when table gets refferenced...
+# ... since we reference the table a lot, it will improve performance a lot - about 30s
+# ... also it will provide consistency across queries (noone should be writing while we read, so this is more theoretical problem than practical...)
+
+latest_version = spark.sql("SELECT max(version) FROM (DESCRIBE HISTORY delta.`/mnt/ADLS/Prepared/Product/Product/DELTA`)").collect()
+refDf = spark.read.format("delta").option("versionAsOf", latest_version[0][0]).load("/mnt/ADLS/Prepared/Product/Product/DELTA")
+refDf.createOrReplaceTempView('refDf')
+%md # Create cleanDf based on the global temp table
+cleanDf = table(spark.conf.get('spark.sql.globalTempDatabase') + '.stg_clean_SAPCAR_Product_Product')
+
+if DebugOutputEnabled:
+  monitor.debug(cleanDf, 'cleanDf')
+%md ## Add expressions
+
+#source does not have information about deleted data, hence we just put placeholder for it
+cleanDf = cleanDf.withColumn('__DeletedFlag', lit(False))
+
+%md # Rename the clean columns to match the prepared column names
+cleanDf = cleanDf.select(
+  col('article_number').alias('article_number')
+  ,col('article_ft').alias('article_ft')
+  ,col('brand').alias('brand')
+  ,col('brand_ft').alias('brand_ft')
+  ,col('merchandise_category').alias('merchandise_category')
+  ,col('main_supplier').alias('main_supplier')
+  ,col('main_supplier_ft').alias('main_supplier_ft')
+  ,col('legacy_id').alias('legacy_id')
+  ,col('product_base_input').alias('product_base_input')
+  ,col('product_old_id').alias('product_old_id')
+  ,col('created_on').alias('created_on')
+  ,col('purchase_order_unit_of_measure').alias('purchase_order_unit_of_measure')
+  ,col('length').alias('length')
+  ,col('width').alias('width')
+  ,col('height').alias('height')
+  ,col('minimum_remaining_shelf_life').alias('minimum_remaining_shelf_life')
+  ,col('total_shelf_life').alias('total_shelf_life')
+  ,col('storage_percentage').alias('storage_percentage')
+  ,col('content_unit').alias('content_unit')
+  ,col('net_content').alias('net_content')
+  ,col('sub_brand').alias('sub_brand')
+  ,col('purchase_group_ft').alias('purchase_group_ft')
+  ,col('source_of_supply').alias('source_of_supply')
+  ,col('supplier_subrange_ft').alias('supplier_subrange_ft')
+  ,col('purchase_group').alias('purchase_group')
+  ,col('file_timestamp').alias('file_timestamp')
+  ,col('input_file_name').alias('input_file_name')	
+  ,col('__DeletedFlag').alias('__DeletedFlag')
+)
+if DebugOutputEnabled:
+	monitor.debug(cleanDf, 'cleanDf after expr')
+
+
+%md # Deduplicate data from clean: get latest version of records per each PK 
+cleanDf = cleanDf.withColumn('__VersionTS', struct(col('file_timestamp')))
+
+cleanLatestPerPK = cleanDf.groupBy(
+  col('article_number')
+).agg(max('__VersionTS').alias('__VersionTS'))
+
+cleanLatestPerPK = cleanLatestPerPK.cache()
+cleanLatestPerPK.createOrReplaceTempView('cleanLatestPerPK')
+
+cleanLatestRecords = cleanDf.join(cleanLatestPerPK, [
+    'article_number'
+    ,'__VersionTS'
+  ]) \
+  .distinct()
+
+cleanDf = cleanDf.drop('__VersionTS')
+cleanLatestRecords = cleanLatestRecords \
+  .select(cleanDf['*']) \
+  .cache()
+cleanLatestRecords.createOrReplaceTempView('cleanLatestRecords')
+
+
+%md # Validate PK uniqueness in deduped dataset
+if PerformPKValidation:
+  PKCheckKeys = [
+    "article_number"
+  ]
+
+  duplicatedPK = cleanLatestRecords.groupBy(PKCheckKeys) \
+    .agg(count(lit(1)).alias('__recordCount')) \
+    .filter(col('__recordCount') > 1) \
+    .cache()
+
+  duplicatedPK.createOrReplaceTempView('duplicatedPK')
+
+  duplicatedPKCount = duplicatedPK.count()
+  
+  if duplicatedPKCount > 0:
+    duplicatedPKMaterialized = duplicatedPK.collect()
+    monitor.debug(duplicatedPK, 'duplicatedPK')
+if PerformPKValidation:  
+  if duplicatedPKCount == 0:
+    cleanRecordCount = cleanDf.count()
+    cleanLatestRecordsCount = cleanLatestRecords.count()
+
+    print("===== PK Validation: OK =====")
+    print("Clean Record Count: {}".format(cleanRecordCount))
+    print("Clean Latest Records Count: {}".format(cleanLatestRecordsCount))
+
+    monitor.registerMetric('Clean Record Count', cleanRecordCount, metricMessageVerb='is')
+    monitor.registerMetric('Clean Latest Records Count', cleanLatestRecordsCount,  metricMessageVerb='is')
+  else:
+    cleanRecordCount = cleanDf.count()
+    cleanLatestRecordsCount = cleanLatestRecords.count()
+    
+    print("===== PK Validation: Error =====")
+    print("Clean Record Count: {}".format(cleanRecordCount))
+    print("Clean Latest Records Count: {}".format(cleanLatestRecordsCount))
+    print("Duplicated PKs Count: {}".format(duplicatedPKCount))
+    print("On PK Validation Error Handling: " + OnPKValidationError)
+    
+    monitor.registerMetric('Clean Record Count', cleanRecordCount, metricMessageVerb='is')
+    monitor.registerMetric('Clean Latest Records Count', cleanLatestRecordsCount,  metricMessageVerb='is')
+    monitor.registerMetric('Duplicated PKs Count', duplicatedPKCount, metricMessageVerb='is')
+    
+    sourceMessageGranularityKeys = ['article_number']
+
+    if OnPKValidationError == 'RejectPK':   
+      cleanLatestRecords = cleanLatestRecords.join(duplicatedPK, on=sourceMessageGranularityKeys, how='leftanti').select(cleanDf['*'])
+      cleanLatestPerPK = cleanLatestPerPK.join(duplicatedPK, on=sourceMessageGranularityKeys, how='leftanti')
+      print("... Rejecting {} PK(s)".format(duplicatedPKCount))
+    elif OnPKValidationError == 'TakeFirstPK':
+      cleanLatestRecords = cleanLatestRecords.drop_duplicates(sourceMessageGranularityKeys)
+      cleanLatestPerPK = cleanLatestPerPK.drop_duplicates(sourceMessageGranularityKeys)    
+      print("... Taking first PK per each of {} PK(s) voliation".format(duplicatedPKCount))
+    else:
+      raise ValueError('PK Validation Failed: ' + str(duplicatedPKMaterialized))    
+
+    cleanLatestPerPK = cleanLatestPerPK.cache()
+    cleanLatestPerPK.createOrReplaceTempView('cleanLatestPerPK')
+    cleanLatestRecords = cleanLatestRecords.cache()
+    cleanLatestRecords.createOrReplaceTempView('cleanLatestRecords')
+    
+    cleanRecordCount = cleanDf.count()
+    cleanLatestRecordsCount = cleanLatestRecords.count()
+    
+    print("Clean Latest Records After {} Deduplication Count: {}".format(OnPKValidationError, cleanLatestRecordsCount))
+    monitor.registerMetric('Clean Latest Records After {} Deduplication Count'.format(OnPKValidationError), cleanLatestRecordsCount, metricMessageVerb="is")
+if DebugOutputEnabled:
+  monitor.debug(cleanLatestPerPK, 'cleanLatestPerPK')
+if DebugOutputEnabled:
+  monitor.debug(cleanLatestRecords, 'cleanLatestRecords')
+
+
+# get all affected records based on the main entity id not flagged as deleted from the conformed versioned 
+refDf_tmp = refDf.drop('__ModifiedTimestamp')
+
+sourceMessageGranularityKeys = ['article_number']
+
+versioningPks = ['article_number']
+
+refDf_InScope = refDf_tmp \
+  .join(cleanLatestPerPK, sourceMessageGranularityKeys) \
+  .select(refDf_tmp['*']) \
+  .distinct() \
+  .filter('__DeletedFlag == FALSE') \
+  .cache()
+
+incrementDf = DimensionProcessingHelper.calculateIncrement(cleanLatestRecords.filter('__DeletedFlag == FALSE'), refDf_InScope, versioningPks, batchTimestamp)
+
+incrementDf = incrementDf.cache()
+incrementDf.createOrReplaceTempView('incrementDf')
+#if DebugOutputEnabled:
+#  monitor.debug(refDf_InScope, 'refDf_InScope')
+#if DebugOutputEnabled:
+#  monitor.debug(incrementDf, 'incrementDf')
+
+if DebugOutputEnabled:
+  pdf = spark.sql('''
+    select version, timestamp from (describe history Prepared_Product_Product)
+    order by version desc limit 1
+    ''').toPandas()
+
+  monitor.debug(pdf, 'delta version before merge')
+%md # There are no partitions defined for this dataset
+#leave empty predicate
+partition_predicate = ''
+
+#check if dataset is not empty
+if len(incrementDf.head(1)) == 0:
+  monitor.registerEmptyBatch()
+  dbutils.notebook.exit(json.dumps({'status': 'NO_NEW_DATA'}))
+%md # Merge into
+mergeDf = spark.sql('''
+
+MERGE INTO Prepared_Product_Product as target
+USING incrementDf as source
+ON target.`article_number` = source.`article_number`
+  {partition_predicate}
+WHEN MATCHED and struct(source.`file_timestamp`) >= struct(target.`file_timestamp`) THEN
+  UPDATE SET
+    `article_number` = source.`article_number`
+    ,`article_ft` = source.`article_ft`
+    ,`brand` = source.`brand`
+    ,`brand_ft` = source.`brand_ft`
+    ,`merchandise_category` = source.`merchandise_category`
+    ,`main_supplier` = source.`main_supplier`
+    ,`main_supplier_ft` = source.`main_supplier_ft`
+    ,`legacy_id` = source.`legacy_id`
+    ,`product_base_input` = source.`product_base_input`
+    ,`product_old_id` = source.`product_old_id`
+    ,`created_on` = source.`created_on`
+    ,`purchase_order_unit_of_measure` = source.`purchase_order_unit_of_measure`
+    ,`length` = source.`length`
+    ,`width` = source.`width`
+    ,`height` = source.`height`
+    ,`minimum_remaining_shelf_life` = source.`minimum_remaining_shelf_life`
+    ,`total_shelf_life` = source.`total_shelf_life`
+    ,`storage_percentage` = source.`storage_percentage`
+    ,`content_unit` = source.`content_unit`
+    ,`net_content` = source.`net_content`
+    ,`sub_brand` = source.`sub_brand`
+    ,`purchase_group_ft` = source.`purchase_group_ft`
+    ,`source_of_supply` = source.`source_of_supply`
+    ,`supplier_subrange_ft` = source.`supplier_subrange_ft`
+    ,`purchase_group` = source.`purchase_group`
+    ,`file_timestamp` = source.`file_timestamp`
+    ,`input_file_name` = source.`input_file_name`
+    ,__ModifiedTimestamp = source.__ModifiedTimestamp
+    ,__DeletedFlag = CASE WHEN source.`__ActionFlag` = 'D' OR source.`__DeletedFlag` THEN TRUE ELSE FALSE END
+WHEN NOT MATCHED THEN 
+  INSERT (
+    `article_number`
+    ,`article_ft`
+    ,`brand`
+    ,`brand_ft`
+    ,`merchandise_category`
+    ,`main_supplier`
+    ,`main_supplier_ft`
+    ,`legacy_id`
+    ,`product_base_input`
+    ,`product_old_id`
+    ,`created_on`
+    ,`purchase_order_unit_of_measure`
+    ,`length`
+    ,`width`
+    ,`height`
+    ,`minimum_remaining_shelf_life`
+    ,`total_shelf_life`
+    ,`storage_percentage`
+    ,`content_unit`
+    ,`net_content`
+    ,`sub_brand`
+    ,`purchase_group_ft`
+    ,`source_of_supply`
+    ,`supplier_subrange_ft`
+    ,`purchase_group`
+    ,`file_timestamp`
+    ,`input_file_name`
+    ,__ModifiedTimestamp
+    ,__DeletedFlag
+  ) VALUES (
+    source.`article_number`
+    ,source.`article_ft`
+    ,source.`brand`
+    ,source.`brand_ft`
+    ,source.`merchandise_category`
+    ,source.`main_supplier`
+    ,source.`main_supplier_ft`
+    ,source.`legacy_id`
+    ,source.`product_base_input`
+    ,source.`product_old_id`
+    ,source.`created_on`
+    ,source.`purchase_order_unit_of_measure`
+    ,source.`length`
+    ,source.`width`
+    ,source.`height`
+    ,source.`minimum_remaining_shelf_life`
+    ,source.`total_shelf_life`
+    ,source.`storage_percentage`
+    ,source.`content_unit`
+    ,source.`net_content`
+    ,source.`sub_brand`
+    ,source.`purchase_group_ft`
+    ,source.`source_of_supply`
+    ,source.`supplier_subrange_ft`
+    ,source.`purchase_group`
+    ,source.`file_timestamp`
+    ,source.`input_file_name`
+    ,source.`__ModifiedTimestamp`
+    ,CASE WHEN source.`__ActionFlag` = 'D' OR source.`__DeletedFlag` THEN TRUE ELSE FALSE END
+  )
+'''.format(partition_predicate=partition_predicate))
+if DebugOutputEnabled:
+  pdf = spark.sql('''
+    select version, timestamp from (describe history Prepared_Product_Product)
+    order by version desc limit 1
+    ''').toPandas()
+
+  monitor.debug(pdf, 'delta version after merge')
+# Execute downstream script(s) (if any)
+dbutils.notebook.run('ProductMD.Prepared2SQL', 0)
+# Execute downstream script(s) (if any)
+dbutils.notebook.run('ProductMD.Prepared2PreparedCSV', 0)
+dbutils.notebook.run('ProductMD.Prepared2ConformedCSV', 0)
+%md # THE END

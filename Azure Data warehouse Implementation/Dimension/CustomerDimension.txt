@@ -1,0 +1,631 @@
+%md ```This notebook was generated using Blade Code Generator v20.3.0.0-462ba3e, by AzureAD\MatiasSamblancat at 2020-11-03 14:03:25```
+%run /Helpers/FeatureFlags
+
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+from datetime import datetime, timedelta
+from pyspark.sql.window import Window
+import pandas as pd
+import pyspark.sql.functions as func
+import json
+
+
+spark.conf.set("spark.databricks.delta.optimizeWrite.enabled","true")
+spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled","false")
+spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.autoCompact", "false")
+
+
+spark.conf.set("spark.databricks.optimizer.dynamicPartitionPruning","true")
+
+
+%run "/Helpers/DimensionProcessingHelper"
+%run /Helpers/Monitoring/QualityMonitoringHelper
+%run /Helpers/DataFrameExtensions
+%run /Helpers/PartitionPruning
+
+
+%md # Initialize Data Quality Monitoring
+monitor = QualityMonitoringHelper('Hybris', 'Customer')
+monitor.addContext('NotebookName', 'Customer.Clean2Prepared.Customer.py')
+monitor.addContext('SubMessage', 'Customer')
+# TODO
+# TODO: Chose behavriour when PK validation finds errors (or totally disable it, and eventually, let job fail)
+# TODO
+PerformPKValidation = True
+OnPKValidationError = 'RejectPK'
+#OnPKValidationError = 'TakeFirstPK'
+#OnPKValidationError = 'RaiseException'
+
+DebugOutputEnabled = FeatureFlags.get('Hybris.Customer.DebugOutputEnabled')
+
+# Register batch date, all jobs will be using this as a modified timestamp
+batchTimestamp = datetime.now()
+
+
+spark.createDataFrame(
+	pd.DataFrame(data={ 
+		'batchTimestamp': [ batchTimestamp ] 
+	})).createOrReplaceTempView('jobparams')
+monitor.addContext('BatchDateTime', batchTimestamp)
+
+%md # Create output table
+## Debug only, usefull to cleaning up data if it's already in bad shape :)
+#dbutils.fs.rm('/mnt/ADLS/Prepared/Customer/Customer/DELTA', True)
+
+%sql
+
+DROP TABLE IF EXISTS Prepared_Customer_Customer;
+
+CREATE TABLE Prepared_Customer_Customer(
+  `file_timestamp` TIMESTAMP
+  ,`account_type` STRING
+  ,`company_name` STRING
+  ,`customer_creation_date` DATE
+  ,`customer_public_hash` STRING
+  ,`customer_type` STRING
+  ,`default_payment_address` STRING
+  ,`default_shipment_address` STRING
+  ,`is_deferred_payment` BOOLEAN
+  ,`gender` STRING
+  ,`is_linked_loyalty` BOOLEAN
+  ,`household_id` STRING
+  ,`is_forgotten` BOOLEAN
+  ,`language` STRING
+  ,`last_login_timestamp` TIMESTAMP
+  ,`preferred_store` STRING
+  ,`has_sms_alert` BOOLEAN
+  ,`unsubscribe_link` STRING
+  ,`customer_token` INT
+  ,`birth_date` STRING
+  ,`has_email` BOOLEAN
+  ,`has_mobile_phone` BOOLEAN
+  ,`has_home_phone` BOOLEAN
+  ,`address_count` INT
+  ,`valid_from` TIMESTAMP
+  ,`valid_to` TIMESTAMP
+  ,`__ModifiedTimestamp` TIMESTAMP
+  ,`__DeletedFlag` BOOLEAN
+)
+USING delta
+LOCATION '/mnt/ADLS/Prepared/Customer/Customer/DELTA'
+
+# use fixed latest snapshot of data, this will reduce overhead on hive to check it each time, when table gets refferenced...
+# ... since we reference the table a lot, it will improve performance a lot - about 30s
+# ... also it will provide consistency across queries (noone should be writing while we read, so this is more theoretical problem than practical...)
+
+latest_version = spark.sql("SELECT max(version) FROM (DESCRIBE HISTORY delta.`/mnt/ADLS/Prepared/Customer/Customer/DELTA`)").collect()
+refDf = spark.read.format("delta").option("versionAsOf", latest_version[0][0]).load("/mnt/ADLS/Prepared/Customer/Customer/DELTA")
+refDf.createOrReplaceTempView('refDf')
+
+%md # Create cleanDf based on the global temp table
+
+cleanDf = table(spark.conf.get('spark.sql.globalTempDatabase') + '.stg_clean_Hybris_Customer_Customer')
+cleanDf = table(spark.conf.get('spark.sql.globalTempDatabase') + '.stg_clean_Hybris_Customer_Customer').drop('customer_token')
+preparedCustomerLookupPIIDf = table(spark.conf.get('spark.sql.globalTempDatabase') + '.stg_PII_Hybris_Customer_CustomerLookup')\
+									.withColumnRenamed('customer_lookup_token','customer_token')
+                                    
+
+if DebugOutputEnabled:
+  monitor.debug(cleanDf, 'cleanDf')
+%md ## Add expressions
+
+#source does not have information about deleted data, hence we just put placeholder for it
+cleanDf = cleanDf.withColumn('__DeletedFlag', lit(False))
+
+
+# Add expressions
+cleanDf = cleanDf.join(preparedCustomerLookupPIIDf, ['customer_public_hash'], 'left')\
+						.fillna('-1', subset=['customer_token'])
+cleanDf = cleanDf.withColumn('customer_token', col('customer_token').cast(IntegerType()))
+cleanDf = cleanDf.withColumn('birth_date', date_format(col('birth_date_full'), "yyyy-MM").cast(StringType()))
+cleanDf = cleanDf.withColumn('has_email', when((col('email').isNull()) | (col('email') == ''), 'FALSE').otherwise('TRUE').cast(BooleanType()))
+cleanDf = cleanDf.withColumn('has_mobile_phone', when((col('mobile_phone').isNull()) | (col('mobile_phone') == ''), 'FALSE').otherwise('TRUE').cast(BooleanType()))
+cleanDf = cleanDf.withColumn('has_home_phone', when((col('home_phone').isNull()) | (col('home_phone') == ''), 'FALSE').otherwise('TRUE').cast(BooleanType()))
+cleanDf = cleanDf.withColumn('address_count', col('address_count').cast(IntegerType()))
+cleanDf = cleanDf.withColumn('valid_from', col('file_timestamp').cast(TimestampType()))
+
+%md # Rename the clean columns to match the prepared column names
+cleanDf = cleanDf.select(
+   col('sequence_number').alias('sequence_number')
+  ,col('file_timestamp').alias('file_timestamp')
+  ,col('account_type').alias('account_type')
+  ,col('company_name').alias('company_name')
+  ,col('customer_creation_date').alias('customer_creation_date')
+  ,col('customer_public_hash').alias('customer_public_hash')
+  ,col('customer_type').alias('customer_type')
+  ,col('default_payment_address').alias('default_payment_address')
+  ,col('default_shipment_address').alias('default_shipment_address')
+  ,col('is_deferred_dayment').alias('is_deferred_payment')
+  ,col('gender').alias('gender')
+  ,col('is_linked_loyalty').alias('is_linked_loyalty')
+  ,col('household_id').alias('household_id')
+  ,col('is_forgotten').alias('is_forgotten')
+  ,col('language').alias('language')
+  ,col('last_login_timestamp').alias('last_login_timestamp')
+  ,col('preferred_store').alias('preferred_store')
+  ,col('has_sms_alert').alias('has_sms_alert')
+  ,col('unsubscribe_link').alias('unsubscribe_link')
+  ,col('customer_token').alias('customer_token')
+  ,col('birth_date').alias('birth_date')
+  ,col('has_email').alias('has_email')
+  ,col('has_mobile_phone').alias('has_mobile_phone')
+  ,col('has_home_phone').alias('has_home_phone')
+  ,col('address_count').alias('address_count')
+  ,col('valid_from').alias('valid_from')	
+  ,col('__DeletedFlag').alias('__DeletedFlag')
+)
+if DebugOutputEnabled:
+	monitor.debug(cleanDf, 'cleanDf after expr')
+
+
+%md # Build versioned dataset based on events from the source
+#list of fields having BatchUpdatePK VersioningStereotype (it must *not* have the valid from date)
+sourceMessageGranularityKeys = ['customer_public_hash']
+
+#define the primary key (it must have the valid from date)
+versioningPks = ['customer_public_hash', 'valid_from']
+
+#get the PKs from the clean
+cleanPK = cleanDf.select(versioningPks).distinct()
+
+#get the minimum valid from date for each PK in clean
+cleanStartingPoint = cleanPK \
+	.groupBy('customer_public_hash') \
+	.agg(min('valid_from').alias('__CleanMinValidFrom'))
+
+#filter out reference rows which are affected by that minimum starting point
+#this will make sure we skip old records to compare against, and hence reduce the overhead
+#TODO:
+#TODO: there is no limitation on ending point, so if you are expecting to get lots of backdated data often (it's unlikly in my scenarios), then similiar implemention for 'ending point' is required as well
+#TODO:
+
+refDf_InScope = refDf \
+	.join(cleanStartingPoint, sourceMessageGranularityKeys) \
+	.select(refDf['*'], '__CleanMinValidFrom') \
+	.filter(
+		(col('valid_from') >= col('__CleanMinValidFrom')) |
+		(col('valid_to') >= col('__CleanMinValidFrom')) |
+		(col('valid_to').isNull())
+	) \
+	.drop('__ModifiedTimestamp') \
+	.drop('__CleanMinValidFrom') \
+    .withColumn('sequence_number', lit(0)) \
+	.cache()
+
+#create new clean, containing full chain of history, so proecssing can treat it as if just came from source
+cleanDf = cleanDf.unionByName(
+  refDf_InScope \
+    .drop('valid_to')
+)
+#if DebugOutputEnabled:
+#  monitor.debug(refDf_InScope, 'refDf_InScope')
+
+
+%md # Deduplicate data from clean: get latest version of records per each PK 
+cleanDf = cleanDf.withColumn('__VersionTS', struct(col('file_timestamp'), col('sequence_number')))
+
+cleanLatestPerPK = cleanDf.groupBy(
+  col('customer_public_hash')
+  ,col('valid_from')
+).agg(max('__VersionTS').alias('__VersionTS'))
+
+cleanLatestPerPK = cleanLatestPerPK.cache()
+cleanLatestPerPK.createOrReplaceTempView('cleanLatestPerPK')
+
+cleanLatestRecords = cleanDf.join(cleanLatestPerPK, [
+    'customer_public_hash'
+    ,'valid_from'
+    ,'__VersionTS'
+  ]) \
+  .distinct()
+
+cleanDf = cleanDf.drop('__VersionTS')
+cleanLatestRecords = cleanLatestRecords \
+  .select(cleanDf['*']) \
+  .cache()
+cleanLatestRecords.createOrReplaceTempView('cleanLatestRecords')
+
+
+%md # Validate PK uniqueness in deduped dataset
+if PerformPKValidation:
+  PKCheckKeys = [
+    "customer_public_hash"
+    ,"valid_from"
+  ]
+
+  duplicatedPK = cleanLatestRecords.groupBy(PKCheckKeys) \
+    .agg(count(lit(1)).alias('__recordCount')) \
+    .filter(col('__recordCount') > 1) \
+    .cache()
+
+  duplicatedPK.createOrReplaceTempView('duplicatedPK')
+
+  duplicatedPKCount = duplicatedPK.count()
+  
+  if duplicatedPKCount > 0:
+    duplicatedPKMaterialized = duplicatedPK.collect()
+    monitor.debug(duplicatedPK, 'duplicatedPK')
+if PerformPKValidation:  
+  if duplicatedPKCount == 0:
+    cleanRecordCount = cleanDf.count()
+    cleanLatestRecordsCount = cleanLatestRecords.count()
+
+    print("===== PK Validation: OK =====")
+    print("Clean Record Count: {}".format(cleanRecordCount))
+    print("Clean Latest Records Count: {}".format(cleanLatestRecordsCount))
+
+    monitor.registerMetric('Clean Record Count', cleanRecordCount, metricMessageVerb='is')
+    monitor.registerMetric('Clean Latest Records Count', cleanLatestRecordsCount,  metricMessageVerb='is')
+  else:
+    cleanRecordCount = cleanDf.count()
+    cleanLatestRecordsCount = cleanLatestRecords.count()
+    
+    print("===== PK Validation: Error =====")
+    print("Clean Record Count: {}".format(cleanRecordCount))
+    print("Clean Latest Records Count: {}".format(cleanLatestRecordsCount))
+    print("Duplicated PKs Count: {}".format(duplicatedPKCount))
+    print("On PK Validation Error Handling: " + OnPKValidationError)
+    
+    monitor.registerMetric('Clean Record Count', cleanRecordCount, metricMessageVerb='is')
+    monitor.registerMetric('Clean Latest Records Count', cleanLatestRecordsCount,  metricMessageVerb='is')
+    monitor.registerMetric('Duplicated PKs Count', duplicatedPKCount, metricMessageVerb='is')
+    
+    sourceMessageGranularityKeys = ['customer_public_hash']
+
+    if OnPKValidationError == 'RejectPK':   
+      cleanLatestRecords = cleanLatestRecords.join(duplicatedPK, on=sourceMessageGranularityKeys, how='leftanti').select(cleanDf['*'])
+      cleanLatestPerPK = cleanLatestPerPK.join(duplicatedPK, on=sourceMessageGranularityKeys, how='leftanti')
+      print("... Rejecting {} PK(s)".format(duplicatedPKCount))
+    elif OnPKValidationError == 'TakeFirstPK':
+      cleanLatestRecords = cleanLatestRecords.drop_duplicates(sourceMessageGranularityKeys)
+      cleanLatestPerPK = cleanLatestPerPK.drop_duplicates(sourceMessageGranularityKeys)    
+      print("... Taking first PK per each of {} PK(s) voliation".format(duplicatedPKCount))
+    else:
+      raise ValueError('PK Validation Failed: ' + str(duplicatedPKMaterialized))    
+
+    cleanLatestPerPK = cleanLatestPerPK.cache()
+    cleanLatestPerPK.createOrReplaceTempView('cleanLatestPerPK')
+    cleanLatestRecords = cleanLatestRecords.cache()
+    cleanLatestRecords.createOrReplaceTempView('cleanLatestRecords')
+    
+    cleanRecordCount = cleanDf.count()
+    cleanLatestRecordsCount = cleanLatestRecords.count()
+    
+    print("Clean Latest Records After {} Deduplication Count: {}".format(OnPKValidationError, cleanLatestRecordsCount))
+    monitor.registerMetric('Clean Latest Records After {} Deduplication Count'.format(OnPKValidationError), cleanLatestRecordsCount, metricMessageVerb="is")
+if DebugOutputEnabled:
+  monitor.debug(cleanLatestPerPK, 'cleanLatestPerPK')
+if DebugOutputEnabled:
+  monitor.debug(cleanLatestRecords, 'cleanLatestRecords')
+
+#Picks the earliest timestamp of each change
+cleanLatestRecords = cleanLatestRecords \
+	.groupBy('account_type', 'company_name', 'customer_creation_date', 'customer_public_hash', 'customer_type', 'default_payment_address', 'default_shipment_address', 'is_deferred_payment', 'gender', 'is_linked_loyalty', 'household_id', 'is_forgotten', 'language', 'last_login_timestamp', 'preferred_store', 'has_sms_alert', 'unsubscribe_link', 'customer_token', 'birth_date', 'has_email', 'has_mobile_phone', 'has_home_phone', 'address_count', '__DeletedFlag').agg(min('valid_from').alias('valid_from'), min('file_timestamp').alias('file_timestamp'))
+inputDf = cleanLatestRecords.drop('valid_to')
+
+#combine reference and the increment, to make 'new reference'
+ValidToWindow = Window.partitionBy('__DeletedFlag', 'customer_public_hash').orderBy(['valid_from'])
+
+inputDf = inputDf \
+  .withColumn('valid_to', lag(inputDf['valid_from'],-1).over(ValidToWindow)) \
+  .select(refDf_InScope.drop('sequence_number').columns) 
+
+#compare against RefDf, to make list of changes that needs be merged in
+incrementDf = DimensionProcessingHelper \
+  .calculateIncrement(inputDf, refDf_InScope.drop('sequence_number'), versioningPks, batchTimestamp) \
+  .cache()
+
+incrementDf.createOrReplaceTempView('incrementDf')
+# %sql
+# select  lag() over(partition by ... order by ...)
+#         lag() over(partition by ... order by ...)
+
+#if DebugOutputEnabled:
+#  monitor.debug(incrementDf, 'incrementDf')
+
+
+
+if DebugOutputEnabled:
+  pdf = spark.sql('''
+    select version, timestamp from (describe history Prepared_Customer_Customer)
+    order by version desc limit 1
+    ''').toPandas()
+
+  monitor.debug(pdf, 'delta version before merge')
+
+%md # There are no partitions defined for this dataset
+#leave empty predicate
+partition_predicate = ''
+
+#check if dataset is not empty
+if len(incrementDf.head(1)) == 0:
+  monitor.registerEmptyBatch()
+  dbutils.notebook.exit(json.dumps({'status': 'NO_NEW_DATA'}))
+%md # Merge into
+
+
+mergeQuery = '''
+
+MERGE INTO Prepared_Customer_Customer as target
+USING incrementDf as source
+ON target.`customer_public_hash` = source.`customer_public_hash`
+  AND target.`valid_from` = source.`valid_from`
+  {partition_predicate}
+WHEN MATCHED and struct(source.`file_timestamp`) >= struct(target.`file_timestamp`) THEN
+  UPDATE SET
+    `file_timestamp` = source.`file_timestamp`
+    ,`account_type` = source.`account_type`
+    ,`company_name` = source.`company_name`
+    ,`customer_creation_date` = source.`customer_creation_date`
+    ,`customer_public_hash` = source.`customer_public_hash`
+    ,`customer_type` = source.`customer_type`
+    ,`default_payment_address` = source.`default_payment_address`
+    ,`default_shipment_address` = source.`default_shipment_address`
+    ,`is_deferred_payment` = source.`is_deferred_payment`
+    ,`gender` = source.`gender`
+    ,`is_linked_loyalty` = source.`is_linked_loyalty`
+    ,`household_id` = source.`household_id`
+    ,`is_forgotten` = source.`is_forgotten`
+    ,`language` = source.`language`
+    ,`last_login_timestamp` = source.`last_login_timestamp`
+    ,`preferred_store` = source.`preferred_store`
+    ,`has_sms_alert` = source.`has_sms_alert`
+    ,`unsubscribe_link` = source.`unsubscribe_link`
+    ,`customer_token` = source.`customer_token`
+    ,`birth_date` = source.`birth_date`
+    ,`has_email` = source.`has_email`
+    ,`has_mobile_phone` = source.`has_mobile_phone`
+    ,`has_home_phone` = source.`has_home_phone`
+    ,`address_count` = source.`address_count`
+    ,`valid_from` = source.`valid_from`
+    ,`valid_to` = source.`valid_to`
+    ,__ModifiedTimestamp = source.__ModifiedTimestamp
+    ,__DeletedFlag = CASE WHEN source.__ActionFlag = 'D' OR source.__DeletedFlag = 1 THEN 1 ELSE 0 END
+WHEN NOT MATCHED THEN 
+  INSERT (
+    `file_timestamp`
+    ,`account_type`
+    ,`company_name`
+    ,`customer_creation_date`
+    ,`customer_public_hash`
+    ,`customer_type`
+    ,`default_payment_address`
+    ,`default_shipment_address`
+    ,`is_deferred_payment`
+    ,`gender`
+    ,`is_linked_loyalty`
+    ,`household_id`
+    ,`is_forgotten`
+    ,`language`
+    ,`last_login_timestamp`
+    ,`preferred_store`
+    ,`has_sms_alert`
+    ,`unsubscribe_link`
+    ,`customer_token`
+    ,`birth_date`
+    ,`has_email`
+    ,`has_mobile_phone`
+    ,`has_home_phone`
+    ,`address_count`
+    ,`valid_from`
+    ,`valid_to`
+    ,__ModifiedTimestamp
+    ,__DeletedFlag
+  ) VALUES (
+    source.`file_timestamp`
+    ,source.`account_type`
+    ,source.`company_name`
+    ,source.`customer_creation_date`
+    ,source.`customer_public_hash`
+    ,source.`customer_type`
+    ,source.`default_payment_address`
+    ,source.`default_shipment_address`
+    ,source.`is_deferred_payment`
+    ,source.`gender`
+    ,source.`is_linked_loyalty`
+    ,source.`household_id`
+    ,source.`is_forgotten`
+    ,source.`language`
+    ,source.`last_login_timestamp`
+    ,source.`preferred_store`
+    ,source.`has_sms_alert`
+    ,source.`unsubscribe_link`
+    ,source.`customer_token`
+    ,source.`birth_date`
+    ,source.`has_email`
+    ,source.`has_mobile_phone`
+    ,source.`has_home_phone`
+    ,source.`address_count`
+    ,source.`valid_from`
+    ,source.`valid_to`
+    ,source.__ModifiedTimestamp
+    ,CASE WHEN source.__ActionFlag = 'D' OR source.__DeletedFlag = 1 THEN 1 ELSE 0 END
+  )
+'''.format(partition_predicate=partition_predicate)
+
+
+mergeDf = spark.sql(mergeQuery)
+if DebugOutputEnabled:
+  pdf = spark.sql('''
+    select version, timestamp from (describe history Prepared_Customer_Customer)
+    order by version desc limit 1
+    ''').toPandas()
+
+  monitor.debug(pdf, 'delta version after merge')
+# Execute downstream script(s) (if any)
+# Disabled - Gen1 Decomissioned
+# dbutils.notebook.run('Customer.Prepared2ConformedCSV.Customer', 0)
+
+%sql
+DROP TABLE IF EXISTS Prepared_Customer_Customer_Identity;
+
+CREATE TABLE Prepared_Customer_Customer_Identity(
+  `customer_sk` BIGINT 
+  ,`file_timestamp` TIMESTAMP
+  ,`account_type` STRING
+  ,`company_name` STRING
+  ,`customer_creation_date` DATE
+  ,`customer_public_hash` STRING
+  ,`customer_type` STRING
+  ,`default_payment_address` STRING
+  ,`default_shipment_address` STRING
+  ,`is_deferred_payment` BOOLEAN
+  ,`gender` STRING
+  ,`is_linked_loyalty` BOOLEAN
+  ,`household_id` STRING
+  ,`is_forgotten` BOOLEAN
+  ,`language` STRING
+  ,`last_login_timestamp` TIMESTAMP
+  ,`preferred_store` STRING
+  ,`has_sms_alert` BOOLEAN
+  ,`unsubscribe_link` STRING
+  ,`customer_token` INT
+  ,`birth_date` STRING
+  ,`has_email` BOOLEAN
+  ,`has_mobile_phone` BOOLEAN
+  ,`has_home_phone` BOOLEAN
+  ,`address_count` INT
+  ,`valid_from` TIMESTAMP
+  ,`valid_to` TIMESTAMP
+  ,`__ModifiedTimestamp` TIMESTAMP
+  ,`__DeletedFlag` BOOLEAN
+)
+USING delta
+LOCATION '/mnt/ADLS/Prepared/Customer/Customer/DELTA_Identity/DELTA'
+
+
+mergeQuery = '''
+
+MERGE INTO Prepared_Customer_Customer_Identity as target
+USING incrementDf as source
+ON target.`customer_public_hash` = source.`customer_public_hash`
+  AND target.`valid_from` = source.`valid_from`
+  {partition_predicate}
+WHEN MATCHED and struct(source.`file_timestamp`) >= struct(target.`file_timestamp`) THEN
+  UPDATE SET
+    `file_timestamp` = source.`file_timestamp`
+    ,`account_type` = source.`account_type`
+    ,`company_name` = source.`company_name`
+    ,`customer_creation_date` = source.`customer_creation_date`
+    ,`customer_public_hash` = source.`customer_public_hash`
+    ,`customer_type` = source.`customer_type`
+    ,`default_payment_address` = source.`default_payment_address`
+    ,`default_shipment_address` = source.`default_shipment_address`
+    ,`is_deferred_payment` = source.`is_deferred_payment`
+    ,`gender` = source.`gender`
+    ,`is_linked_loyalty` = source.`is_linked_loyalty`
+    ,`household_id` = source.`household_id`
+    ,`is_forgotten` = source.`is_forgotten`
+    ,`language` = source.`language`
+    ,`last_login_timestamp` = source.`last_login_timestamp`
+    ,`preferred_store` = source.`preferred_store`
+    ,`has_sms_alert` = source.`has_sms_alert`
+    ,`unsubscribe_link` = source.`unsubscribe_link`
+    ,`customer_token` = source.`customer_token`
+    ,`birth_date` = source.`birth_date`
+    ,`has_email` = source.`has_email`
+    ,`has_mobile_phone` = source.`has_mobile_phone`
+    ,`has_home_phone` = source.`has_home_phone`
+    ,`address_count` = source.`address_count`
+    ,`valid_from` = source.`valid_from`
+    ,`valid_to` = source.`valid_to`
+    ,__ModifiedTimestamp = source.__ModifiedTimestamp
+    ,__DeletedFlag = CASE WHEN source.__ActionFlag = 'D' OR source.__DeletedFlag = 1 THEN 1 ELSE 0 END
+WHEN NOT MATCHED THEN 
+  INSERT (
+    `file_timestamp`
+    ,`account_type`
+    ,`company_name`
+    ,`customer_creation_date`
+    ,`customer_public_hash`
+    ,`customer_type`
+    ,`default_payment_address`
+    ,`default_shipment_address`
+    ,`is_deferred_payment`
+    ,`gender`
+    ,`is_linked_loyalty`
+    ,`household_id`
+    ,`is_forgotten`
+    ,`language`
+    ,`last_login_timestamp`
+    ,`preferred_store`
+    ,`has_sms_alert`
+    ,`unsubscribe_link`
+    ,`customer_token`
+    ,`birth_date`
+    ,`has_email`
+    ,`has_mobile_phone`
+    ,`has_home_phone`
+    ,`address_count`
+    ,`valid_from`
+    ,`valid_to`
+    ,__ModifiedTimestamp
+    ,__DeletedFlag
+  ) VALUES (
+    source.`file_timestamp`
+    ,source.`account_type`
+    ,source.`company_name`
+    ,source.`customer_creation_date`
+    ,source.`customer_public_hash`
+    ,source.`customer_type`
+    ,source.`default_payment_address`
+    ,source.`default_shipment_address`
+    ,source.`is_deferred_payment`
+    ,source.`gender`
+    ,source.`is_linked_loyalty`
+    ,source.`household_id`
+    ,source.`is_forgotten`
+    ,source.`language`
+    ,source.`last_login_timestamp`
+    ,source.`preferred_store`
+    ,source.`has_sms_alert`
+    ,source.`unsubscribe_link`
+    ,source.`customer_token`
+    ,source.`birth_date`
+    ,source.`has_email`
+    ,source.`has_mobile_phone`
+    ,source.`has_home_phone`
+    ,source.`address_count`
+    ,source.`valid_from`
+    ,source.`valid_to`
+    ,source.__ModifiedTimestamp
+    ,CASE WHEN source.__ActionFlag = 'D' OR source.__DeletedFlag = 1 THEN 1 ELSE 0 END
+  )
+'''.format(partition_predicate=partition_predicate)
+
+
+mergeDf = spark.sql(mergeQuery)
+custDf = spark.read.format("delta").load("/mnt/ADLS/Prepared/Customer/Customer/DELTA_Identity/DELTA")
+custDf.createOrReplaceTempView('custDf')
+#incrementDf = spark.read.format("delta").load("/mnt/ADLS/Prepared/Customer/Customer/DELTA")
+incrementDf.createOrReplaceTempView('deltaDf')
+%md # Generate Surrogate key 
+custskmax=spark.sql("select coalesce(max(customer_sk),0)custskmax from custDf")
+custskmaxInt=custskmax.head()[0]
+skgen_query ='''
+select DENSE_RANK()over(order by Hash1)+{custskmaxInt} as customer_sk,customer_public_hash,valid_from  from (
+select hash(customer_public_hash) as Hash1,customer_public_hash,valid_from
+from deltaDf where customer_public_hash in 
+  ( 
+    select customer_public_hash from
+     (  
+                    select customer_public_hash,valid_from from deltaDf
+                    except
+                    select customer_public_hash,valid_from from custDf where customer_sk is not null
+     )C
+  )    
+)X
+'''.format(custskmaxInt=custskmaxInt)
+deltadff=spark.sql(skgen_query)
+deltadff.createOrReplaceTempView('deltadff')
+mergeQuery = '''
+merge into custDf as c
+using deltadff as d
+on d.`customer_public_hash` = c.`customer_public_hash` and d.`valid_from` = c.`valid_from` 
+when matched then
+update set
+c.`customer_sk`=d.`customer_sk`
+'''
+
+mergeDf = spark.sql(mergeQuery)
+%md # THE END
