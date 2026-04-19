@@ -1,0 +1,9 @@
+store_id,store_name,city,region,store_type,opening_date,_ingested_at
+FC001,FreshCart Brugge Centrum,Brugge,Flanders,SUPERMARKET,2015-03-10,2026-04-16 03:15:00
+FC002,FreshCart Gent Zuid,Gent,Flanders,SUPERMARKET,2016-07-22,2026-04-16 03:15:00
+FC003,FreshCart Antwerpen Noord,Antwerpen,Flanders,SUPERMARKET,2014-11-05,2026-04-16 03:15:00
+FC004,FreshCart Leuven Express,Leuven,Flanders,EXPRESS,2018-02-14,2026-04-16 03:15:00
+FC005,FreshCart Brussel Louise,Brussel,Brussels,SUPERMARKET,2017-09-01,2026-04-16 03:15:00
+FC006,FreshCart Liège Guillemins,Liège,Wallonia,SUPERMARKET,2019-04-20,2026-04-16 03:15:00
+FC007,FreshCart Namur Express,Namur,Wallonia,EXPRESS,2020-08-15,2026-04-16 03:15:00
+FC008,FreshCart Online,Online,Flanders,ONLINE,2021-01-01,2026-04-16 03:15:00

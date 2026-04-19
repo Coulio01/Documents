@@ -1,0 +1,55 @@
+name: 'freshcart_analytics'
+version: '1.0.0'
+config-version: 2
+
+profile: 'freshcart_analytics'
+
+model-paths:    ["models"]
+analysis-paths: ["analyses"]
+test-paths:     ["tests"]
+seed-paths:     ["seeds"]
+macro-paths:    ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path:  "target"
+clean-targets: ["target", "dbt_packages"]
+
+# ---------------------------------------------------------------------------
+# Model configuration per layer
+# ---------------------------------------------------------------------------
+models:
+  freshcart_analytics:
+
+    staging:
+      +materialized: view          # Silver — views on Lakehouse SQL endpoint
+      +schema: silver
+      +tags: ['staging', 'silver']
+
+    intermediate:
+      +materialized: ephemeral     # Injected as CTEs — not persisted
+      +tags: ['intermediate']
+
+    marts:
+      +materialized: table         # Gold — persisted tables in Fabric Data Warehouse
+      +schema: gold
+      +tags: ['mart', 'gold']
+
+      finance:
+        +tags: ['finance']
+
+      operations:
+        +tags: ['operations']
+
+# ---------------------------------------------------------------------------
+# Global variable overrides per target (dev / test / prod)
+# ---------------------------------------------------------------------------
+vars:
+  # Lookback window for incremental models (days)
+  incremental_lookback_days: 3
+
+  # Source system identifiers
+  pos_system: 'POS_V2'
+  erp_system: 'NAVISION'
+
+  # Flag to enable/disable expensive models in dev
+  enable_full_refresh: false

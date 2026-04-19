@@ -1,0 +1,119 @@
+# =============================================================================
+# deploy_test.yml — Deploy to TEST Environment
+# Trigger  : Push / merge to the develop branch
+# Strategy : Full dbt build against the shared TEST Fabric workspace.
+#            Uploads the new manifest for slim CI use in PRs.
+#            Notifies Microsoft Teams on success or failure.
+# =============================================================================
+
+name: Deploy — TEST Environment
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - 'models/**'
+      - 'tests/**'
+      - 'macros/**'
+      - 'dbt_project.yml'
+      - 'packages.yml'
+
+jobs:
+
+  deploy_test:
+    name: Full dbt build → TEST
+    runs-on: ubuntu-latest
+    environment: test
+
+    steps:
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ──────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. ODBC Driver ─────────────────────────────────────────────────────
+      - name: Install ODBC Driver 18 for SQL Server
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+
+      # ── 4. Install dbt ─────────────────────────────────────────────────────
+      - name: Install dbt-fabric
+        run: |
+          pip install --upgrade pip
+          pip install dbt-fabric==1.8.*
+
+      # ── 5. dbt packages ────────────────────────────────────────────────────
+      - name: Install dbt packages
+        run: dbt deps
+        env:
+          DBT_PROFILES_DIR: .
+
+      # ── 6. dbt source freshness ────────────────────────────────────────────
+      - name: Check source freshness
+        run: dbt source freshness --target test --profiles-dir .
+        env:
+          DBT_PROFILES_DIR:          .
+          FABRIC_TENANT_ID:          ${{ secrets.FABRIC_TENANT_ID }}
+          FABRIC_TEST_SERVER:        ${{ secrets.FABRIC_TEST_SERVER }}
+          FABRIC_TEST_DATABASE:      ${{ secrets.FABRIC_TEST_DATABASE }}
+          FABRIC_TEST_CLIENT_ID:     ${{ secrets.FABRIC_TEST_CLIENT_ID }}
+          FABRIC_TEST_CLIENT_SECRET: ${{ secrets.FABRIC_TEST_CLIENT_SECRET }}
+          FABRIC_LAKEHOUSE_DATABASE: ${{ secrets.FABRIC_TEST_LAKEHOUSE_DATABASE }}
+
+      # ── 7. Full dbt build ──────────────────────────────────────────────────
+      - name: dbt build (full)
+        run: dbt build --target test --profiles-dir . --fail-fast
+        env:
+          DBT_PROFILES_DIR:          .
+          FABRIC_TENANT_ID:          ${{ secrets.FABRIC_TENANT_ID }}
+          FABRIC_TEST_SERVER:        ${{ secrets.FABRIC_TEST_SERVER }}
+          FABRIC_TEST_DATABASE:      ${{ secrets.FABRIC_TEST_DATABASE }}
+          FABRIC_TEST_CLIENT_ID:     ${{ secrets.FABRIC_TEST_CLIENT_ID }}
+          FABRIC_TEST_CLIENT_SECRET: ${{ secrets.FABRIC_TEST_CLIENT_SECRET }}
+          FABRIC_LAKEHOUSE_DATABASE: ${{ secrets.FABRIC_TEST_LAKEHOUSE_DATABASE }}
+
+      # ── 8. Upload test manifest to Azure Blob (used by PR slim CI) ─────────
+      - name: Upload test manifest to Azure Blob
+        if: success()
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az storage blob upload \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --container-name dbt-artifacts \
+              --name test/manifest.json \
+              --file ./target/manifest.json \
+              --overwrite \
+              --auth-mode login
+
+      # ── 9. Notify Teams — Success ──────────────────────────────────────────
+      - name: Notify Teams (success)
+        if: success()
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token:        ${{ github.token }}
+          ms-teams-webhook-uri: ${{ secrets.TEAMS_WEBHOOK_URI }}
+          notification-summary: "✅ FreshCart dbt TEST deploy succeeded"
+          notification-color:   "00b300"
+          timezone:             "Europe/Brussels"
+
+      # ── 10. Notify Teams — Failure ─────────────────────────────────────────
+      - name: Notify Teams (failure)
+        if: failure()
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token:        ${{ github.token }}
+          ms-teams-webhook-uri: ${{ secrets.TEAMS_WEBHOOK_URI }}
+          notification-summary: "❌ FreshCart dbt TEST deploy FAILED — check logs"
+          notification-color:   "ff0000"
+          timezone:             "Europe/Brussels"

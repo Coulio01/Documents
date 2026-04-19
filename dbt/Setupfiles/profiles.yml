@@ -1,0 +1,69 @@
+# =============================================================================
+# FreshCart Analytics — dbt Profiles
+# Location: ~/.dbt/profiles.yml  (never commit this file to Git)
+# =============================================================================
+#
+# Environments:
+#   dev   → personal dev workspace in Fabric
+#   test  → shared test workspace in Fabric
+#   prod  → production workspace in Fabric
+#
+# Authentication: Service Principal (recommended for all non-dev targets)
+# Driver:         ODBC Driver 18 for SQL Server (required for Fabric)
+# =============================================================================
+
+freshcart_analytics:
+
+  # Default target when running dbt locally
+  target: dev
+
+  outputs:
+
+    # -------------------------------------------------------------------------
+    # DEV — individual developer workspace
+    # Use Azure CLI auth for local dev (no secrets needed)
+    # -------------------------------------------------------------------------
+    dev:
+      type: fabric
+      driver: 'ODBC Driver 18 for SQL Server'
+      server:   "{{ env_var('FABRIC_DEV_SERVER') }}"
+      database: "{{ env_var('FABRIC_DEV_DATABASE') }}"
+      schema: dbo
+      authentication: CLI         # Uses `az login` — no secret needed locally
+      threads: 4
+      connect_timeout: 30
+      retries: 2
+
+    # -------------------------------------------------------------------------
+    # TEST — shared test workspace (Service Principal)
+    # -------------------------------------------------------------------------
+    test:
+      type: fabric
+      driver: 'ODBC Driver 18 for SQL Server'
+      server:   "{{ env_var('FABRIC_TEST_SERVER') }}"
+      database: "{{ env_var('FABRIC_TEST_DATABASE') }}"
+      schema: dbo
+      authentication: ServicePrincipal
+      tenant_id:     "{{ env_var('FABRIC_TENANT_ID') }}"
+      client_id:     "{{ env_var('FABRIC_TEST_CLIENT_ID') }}"
+      client_secret: "{{ env_var('FABRIC_TEST_CLIENT_SECRET') }}"
+      threads: 4
+      connect_timeout: 30
+      retries: 3
+
+    # -------------------------------------------------------------------------
+    # PROD — production workspace (Service Principal, read-only SP for safety)
+    # -------------------------------------------------------------------------
+    prod:
+      type: fabric
+      driver: 'ODBC Driver 18 for SQL Server'
+      server:   "{{ env_var('FABRIC_PROD_SERVER') }}"
+      database: "{{ env_var('FABRIC_PROD_DATABASE') }}"
+      schema: dbo
+      authentication: ServicePrincipal
+      tenant_id:     "{{ env_var('FABRIC_TENANT_ID') }}"
+      client_id:     "{{ env_var('FABRIC_PROD_CLIENT_ID') }}"
+      client_secret: "{{ env_var('FABRIC_PROD_CLIENT_SECRET') }}"
+      threads: 8
+      connect_timeout: 60
+      retries: 5

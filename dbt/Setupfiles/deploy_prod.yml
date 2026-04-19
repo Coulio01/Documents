@@ -1,0 +1,190 @@
+# =============================================================================
+# deploy_prod.yml — Deploy to PRODUCTION Environment
+# Trigger  : Push / merge to the main branch
+# Strategy : Full dbt build against PROD Fabric workspace.
+#            Requires MANUAL APPROVAL via GitHub Environment protection rules.
+#            Uploads fresh prod manifest for slim CI state comparison.
+#            Tags the Git commit with the release version on success.
+#            Notifies Microsoft Teams with full run summary.
+# =============================================================================
+
+name: Deploy — PRODUCTION
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'models/**'
+      - 'tests/**'
+      - 'macros/**'
+      - 'dbt_project.yml'
+      - 'packages.yml'
+
+jobs:
+
+  # ============================================================================
+  # JOB 1: Pre-flight checks (runs immediately, before approval wait)
+  # ============================================================================
+  preflight:
+    name: Pre-flight checks
+    runs-on: ubuntu-latest
+    environment: test               # Re-run against test as a final gate check
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install ODBC Driver 18 for SQL Server
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+
+      - name: Install dbt-fabric
+        run: |
+          pip install --upgrade pip
+          pip install dbt-fabric==1.8.*
+
+      - name: Install dbt packages
+        run: dbt deps
+        env:
+          DBT_PROFILES_DIR: .
+
+      # Run source freshness against TEST as a pre-prod sanity check
+      - name: Check source freshness (test)
+        run: dbt source freshness --target test --profiles-dir .
+        env:
+          DBT_PROFILES_DIR:          .
+          FABRIC_TENANT_ID:          ${{ secrets.FABRIC_TENANT_ID }}
+          FABRIC_TEST_SERVER:        ${{ secrets.FABRIC_TEST_SERVER }}
+          FABRIC_TEST_DATABASE:      ${{ secrets.FABRIC_TEST_DATABASE }}
+          FABRIC_TEST_CLIENT_ID:     ${{ secrets.FABRIC_TEST_CLIENT_ID }}
+          FABRIC_TEST_CLIENT_SECRET: ${{ secrets.FABRIC_TEST_CLIENT_SECRET }}
+          FABRIC_LAKEHOUSE_DATABASE: ${{ secrets.FABRIC_TEST_LAKEHOUSE_DATABASE }}
+
+      # Compile-only check — validates SQL syntax without running anything on prod
+      - name: dbt compile (syntax check)
+        run: dbt compile --target test --profiles-dir .
+        env:
+          DBT_PROFILES_DIR:          .
+          FABRIC_TENANT_ID:          ${{ secrets.FABRIC_TENANT_ID }}
+          FABRIC_TEST_SERVER:        ${{ secrets.FABRIC_TEST_SERVER }}
+          FABRIC_TEST_DATABASE:      ${{ secrets.FABRIC_TEST_DATABASE }}
+          FABRIC_TEST_CLIENT_ID:     ${{ secrets.FABRIC_TEST_CLIENT_ID }}
+          FABRIC_TEST_CLIENT_SECRET: ${{ secrets.FABRIC_TEST_CLIENT_SECRET }}
+          FABRIC_LAKEHOUSE_DATABASE: ${{ secrets.FABRIC_TEST_LAKEHOUSE_DATABASE }}
+
+  # ============================================================================
+  # JOB 2: Deploy to PROD (waits for manual approval + preflight success)
+  # ============================================================================
+  deploy_prod:
+    name: Full dbt build → PROD
+    runs-on: ubuntu-latest
+    needs: preflight
+    environment: production         # ← GitHub Environment with required reviewers
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install ODBC Driver 18 for SQL Server
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+
+      - name: Install dbt-fabric
+        run: |
+          pip install --upgrade pip
+          pip install dbt-fabric==1.8.*
+
+      - name: Install dbt packages
+        run: dbt deps
+        env:
+          DBT_PROFILES_DIR: .
+
+      # ── Full production build ───────────────────────────────────────────────
+      - name: dbt build (PROD — full)
+        run: dbt build --target prod --profiles-dir . --fail-fast
+        env:
+          DBT_PROFILES_DIR:          .
+          FABRIC_TENANT_ID:          ${{ secrets.FABRIC_TENANT_ID }}
+          FABRIC_PROD_SERVER:        ${{ secrets.FABRIC_PROD_SERVER }}
+          FABRIC_PROD_DATABASE:      ${{ secrets.FABRIC_PROD_DATABASE }}
+          FABRIC_PROD_CLIENT_ID:     ${{ secrets.FABRIC_PROD_CLIENT_ID }}
+          FABRIC_PROD_CLIENT_SECRET: ${{ secrets.FABRIC_PROD_CLIENT_SECRET }}
+          FABRIC_LAKEHOUSE_DATABASE: ${{ secrets.FABRIC_PROD_LAKEHOUSE_DATABASE }}
+
+      # ── Upload fresh prod manifest (enables slim CI in future PRs) ──────────
+      - name: Upload prod manifest to Azure Blob
+        if: success()
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az storage blob upload \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --container-name dbt-artifacts \
+              --name prod/manifest.json \
+              --file ./target/manifest.json \
+              --overwrite \
+              --auth-mode login
+
+      # ── Also archive manifest with run timestamp for rollback capability ────
+      - name: Archive manifest with timestamp (rollback support)
+        if: success()
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+            az storage blob upload \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --container-name dbt-artifacts \
+              --name prod/history/manifest_${TIMESTAMP}.json \
+              --file ./target/manifest.json \
+              --auth-mode login
+
+      # ── Tag the release commit ─────────────────────────────────────────────
+      - name: Tag release commit
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TAG="prod-$(date -u +%Y%m%d-%H%M%S)"
+          git tag $TAG
+          git push origin $TAG
+
+      # ── Notify Teams — Success ─────────────────────────────────────────────
+      - name: Notify Teams (success)
+        if: success()
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token:         ${{ github.token }}
+          ms-teams-webhook-uri: ${{ secrets.TEAMS_WEBHOOK_URI }}
+          notification-summary: "✅ FreshCart dbt PROD deploy succeeded — models refreshed"
+          notification-color:   "00b300"
+          timezone:             "Europe/Brussels"
+
+      # ── Notify Teams — Failure ─────────────────────────────────────────────
+      - name: Notify Teams (failure)
+        if: failure()
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token:         ${{ github.token }}
+          ms-teams-webhook-uri: ${{ secrets.TEAMS_WEBHOOK_URI }}
+          notification-summary: "🚨 FreshCart dbt PROD deploy FAILED — IMMEDIATE ACTION REQUIRED"
+          notification-color:   "ff0000"
+          timezone:             "Europe/Brussels"

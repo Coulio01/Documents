@@ -1,0 +1,127 @@
+# =============================================================================
+# pr_check.yml — Pull Request Validation (Slim CI)
+# Trigger : Every PR opened or updated against the develop branch
+# Strategy: dbt slim CI — only builds models that changed + their descendants
+#           Uses the last prod manifest.json for state comparison
+# =============================================================================
+
+name: PR Check — Slim CI
+
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - 'models/**'
+      - 'tests/**'
+      - 'macros/**'
+      - 'dbt_project.yml'
+      - 'packages.yml'
+
+jobs:
+
+  dbt_slim_ci:
+    name: dbt build (changed models only)
+    runs-on: ubuntu-latest
+    environment: test               # Uses GitHub Environment: test
+
+    steps:
+
+      # ── 1. Checkout code ───────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install ODBC Driver 18 (required for Fabric) ───────────────────
+      - name: Install ODBC Driver 18 for SQL Server
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
+
+      # ── 4. Install dbt + Fabric adapter ───────────────────────────────────
+      - name: Install dbt-fabric
+        run: |
+          pip install --upgrade pip
+          pip install dbt-fabric==1.8.*
+
+      # ── 5. Install dbt packages (dbt-utils, dbt-expectations) ─────────────
+      - name: Install dbt packages
+        run: dbt deps
+        env:
+          DBT_PROFILES_DIR: .
+
+      # ── 6. Download last prod manifest for state comparison ───────────────
+      #       The manifest is stored in Azure Blob Storage after every prod run
+      - name: Download prod manifest (for slim CI)
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az storage blob download \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --container-name dbt-artifacts \
+              --name prod/manifest.json \
+              --file ./prod_manifest.json \
+              --auth-mode login
+        continue-on-error: true     # First run: no manifest yet — that's OK
+
+      # ── 7. dbt debug — verify connection to TEST workspace ─────────────────
+      - name: dbt debug
+        run: dbt debug --target test --profiles-dir .
+        env:
+          DBT_PROFILES_DIR:          .
+          FABRIC_TENANT_ID:          ${{ secrets.FABRIC_TENANT_ID }}
+          FABRIC_TEST_SERVER:        ${{ secrets.FABRIC_TEST_SERVER }}
+          FABRIC_TEST_DATABASE:      ${{ secrets.FABRIC_TEST_DATABASE }}
+          FABRIC_TEST_CLIENT_ID:     ${{ secrets.FABRIC_TEST_CLIENT_ID }}
+          FABRIC_TEST_CLIENT_SECRET: ${{ secrets.FABRIC_TEST_CLIENT_SECRET }}
+          FABRIC_LAKEHOUSE_DATABASE: ${{ secrets.FABRIC_TEST_LAKEHOUSE_DATABASE }}
+
+      # ── 8. dbt build — slim CI (only changed + downstream) ────────────────
+      - name: dbt build (slim CI)
+        run: |
+          if [ -f ./prod_manifest.json ]; then
+            echo "Prod manifest found — running slim CI"
+            dbt build \
+              --target test \
+              --profiles-dir . \
+              --select state:modified+ \
+              --defer \
+              --state ./prod_manifest.json
+          else
+            echo "No prod manifest — running full build (first run)"
+            dbt build --target test --profiles-dir .
+          fi
+        env:
+          DBT_PROFILES_DIR:          .
+          FABRIC_TENANT_ID:          ${{ secrets.FABRIC_TENANT_ID }}
+          FABRIC_TEST_SERVER:        ${{ secrets.FABRIC_TEST_SERVER }}
+          FABRIC_TEST_DATABASE:      ${{ secrets.FABRIC_TEST_DATABASE }}
+          FABRIC_TEST_CLIENT_ID:     ${{ secrets.FABRIC_TEST_CLIENT_ID }}
+          FABRIC_TEST_CLIENT_SECRET: ${{ secrets.FABRIC_TEST_CLIENT_SECRET }}
+          FABRIC_LAKEHOUSE_DATABASE: ${{ secrets.FABRIC_TEST_LAKEHOUSE_DATABASE }}
+
+      # ── 9. Post results as PR comment ──────────────────────────────────────
+      - name: Post dbt results to PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅ Passed' : '❌ Failed';
+            const body = `## dbt Slim CI — ${status}\n\n` +
+              `**Target:** TEST workspace\n` +
+              `**Strategy:** \`state:modified+\` (changed models + descendants)\n` +
+              `**Commit:** \`${{ github.sha }}\`\n\n` +
+              `Check the [Actions log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

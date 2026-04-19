@@ -1,0 +1,155 @@
+version: 2
+
+# =============================================================================
+# FreshCart — Staging Layer: Column Tests & Documentation
+# =============================================================================
+
+models:
+
+  # ---------------------------------------------------------------------------
+  - name: stg_sales
+    description: >
+      Cleaned and type-cast sales transaction line items from the POS system.
+      One row per product line per transaction. Excludes voided and zero-quantity lines.
+    columns:
+      - name: transaction_id
+        description: Unique identifier for the sale transaction
+        tests: [not_null, unique]
+
+      - name: store_id
+        description: Store identifier (FC001–FC008)
+        tests: [not_null]
+
+      - name: product_sku
+        description: Product SKU code
+        tests: [not_null]
+
+      - name: customer_id
+        description: Loyalty customer ID, or 'ANONYMOUS' for non-loyalty purchases
+        tests: [not_null]
+
+      - name: sale_date
+        description: Date the sale occurred
+        tests: [not_null]
+
+      - name: quantity_sold
+        description: Number of units sold (always > 0)
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 1
+              max_value: 9999
+
+      - name: unit_price
+        description: Price per unit in EUR at time of sale
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 10000
+
+      - name: gross_revenue
+        description: quantity_sold × unit_price in EUR
+        tests: [not_null]
+
+      - name: payment_method
+        description: Standardised payment method
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['CASH', 'CARD', 'ONLINE']
+
+  # ---------------------------------------------------------------------------
+  - name: stg_inventory
+    description: >
+      Daily end-of-day inventory snapshots per store and product.
+      Sourced from ERP Navision nightly export.
+    columns:
+      - name: store_id
+        tests: [not_null]
+
+      - name: product_sku
+        tests: [not_null]
+
+      - name: snapshot_date
+        tests: [not_null]
+
+      - name: quantity_on_hand
+        description: Units physically in stock at end of day
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 99999
+
+      - name: stock_status
+        description: Derived stock status flag
+        tests:
+          - accepted_values:
+              values: ['OUT_OF_STOCK', 'LOW_STOCK', 'ADEQUATE']
+
+  # ---------------------------------------------------------------------------
+  - name: stg_products
+    description: >
+      Standardised product master data from ERP. Deduplicated to one row per SKU.
+    columns:
+      - name: sku
+        description: Unique product SKU (primary key)
+        tests: [not_null, unique]
+
+      - name: product_name
+        tests: [not_null]
+
+      - name: product_category
+        tests: [not_null]
+
+      - name: unit_cost
+        description: Supplier cost price in EUR
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 10000
+
+  # ---------------------------------------------------------------------------
+  - name: stg_customers
+    description: >
+      Cleaned loyalty customer profiles. Deduplicated to one row per customer_id.
+    columns:
+      - name: customer_id
+        tests: [not_null, unique]
+
+      - name: email
+        tests:
+          - not_null
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+      - name: registration_date
+        tests: [not_null]
+
+      - name: tenure_days
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 0
+              max_value: 36500
+
+  # ---------------------------------------------------------------------------
+  - name: stg_stores
+    description: >
+      Standardised store reference data. One row per store_id.
+    columns:
+      - name: store_id
+        tests: [not_null, unique]
+
+      - name: store_name
+        tests: [not_null]
+
+      - name: region
+        tests:
+          - accepted_values:
+              values: ['Flanders', 'Wallonia', 'Brussels']
+
+      - name: store_type
+        tests:
+          - accepted_values:
+              values: ['SUPERMARKET', 'EXPRESS', 'ONLINE']
