@@ -8,3 +8,12 @@ https://apps.powerapps.com/play/e/default-024c2d3e-a5e0-4761-b8c0-17b11422060b/a
 
 Power Page link : https://laco-employee-portal.powerappsportals.com/
 and then login with your Laco account
+
+
+Create a new page to submit a leave request connected to the leaveRequest with only 2 section.
+section 1 for the brand and site description 
+section 2 should contain
+1-/ A form including the de following items: name , email , date leave , date end and a submit button
+2-/A list of leaveRequest data
+
+Use blue and yellow as theme
