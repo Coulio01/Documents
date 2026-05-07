@@ -9,11 +9,11 @@ Setps:
 
 name : sp-fabric-deployment-test
 
-app id             = 16c5b3c7-b58b-49e8-8a45-f33bbdf5c54c   
+app id             = <REDACTED>  
 
-tenant Id          = 024c2d3e-a5e0-4761-b8c0-17b11422060b
+tenant Id          = <REDACTED>
 
-fabrict-dbt-secret = XcO8Q\~\~S\_PokntA82tsxtCsQ2TwiRSo3OfNqnbcu
+fabrict-dbt-secret = <REDACTED>
 
 
 
@@ -21,7 +21,7 @@ fabrict-dbt-secret = XcO8Q\~\~S\_PokntA82tsxtCsQ2TwiRSo3OfNqnbcu
 
 user : app:<app id>@<tenant Id>
 
-user : app:16c5b3c7-b58b-49e8-8a45-f33bbdf5c54c@024c2d3e-a5e0-4761-b8c0-17b11422060b 
+user : app:<REDACTED>@<REDACTED> 
 
 
 
@@ -49,11 +49,11 @@ variables values
 
 
 
-&#x20;  FABRIC\_TEST\_CLIENT\_ID=16c5b3c7-b58b-49e8-8a45-f33bbdf5c54c
+&#x20;  FABRIC\_TEST\_CLIENT\_ID=<REDACTED>
 
-&#x20;  FABRIC\_TENANT\_ID=024c2d3e-a5e0-4761-b8c0-17b11422060b
+&#x20;  FABRIC\_TENANT\_ID=<REDACTED>
 
-&#x20;   FABRIC\_TEST\_CLIENT\_SECRET=XcO8Q\~\~S\_PokntA82tsxtCsQ2TwiRSo3OfNqnbcu 
+&#x20;   FABRIC\_TEST\_CLIENT\_SECRET=<REDACTED> 
 
 
 
